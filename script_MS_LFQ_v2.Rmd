@@ -1,0 +1,676 @@
+---
+title: "Exptn_name"
+output: html_notebook
+---
+#Define path here
+New versions of of R Notebook understand setwd() only when you run an entire chunk and only when you are within that chunk, so we use this bit of code instead
+```{r setup, include=FALSE, echo=FALSE}
+require("knitr")
+opts_knit$set(root.dir = "C:/Users/your_path")
+```
+
+Lots of bits of code here comes directly from vignette of the DEP package that I use to analyze the data
+First, load required packages. 
+
+```{r}
+library("DEP")
+library("plotly")
+library("tidyverse")
+```
+
+#Additional functions
+O: Wera used them, but I rarely do. These are more or less the same as in the standard package
+W: Add functions that might be useful. I did not write this function. I got it from the author of DEP package 
+
+```{r}
+get_kmeans_matrix <- function(dep, type = c("contrast", "centered"), kmeans = TRUE, k = 6) {
+  # Show error if inputs are not the required classes
+  if(is.integer(k)) k <- as.numeric(k)
+  assertthat::assert_that(inherits(dep, "SummarizedExperiment"),
+                          is.character(type),
+                          is.logical(kmeans),
+                          is.numeric(k),
+                          length(k) == 1)
+  
+  # Show error if inputs do not contain required columns
+  type <- match.arg(type)
+  
+  # Extract row and col data
+  row_data <- rowData(dep)
+  col_data <- colData(dep) %>%
+    as.data.frame()
+  
+  # Show error if inputs do not contain required columns
+  if(any(!c("label", "condition", "replicate") %in% colnames(col_data))) {
+    stop(paste0("'label', 'condition' and/or 'replicate' columns are not present in '",
+                deparse(substitute(dep)), "'"),
+         call. = FALSE)
+  }
+  if(length(grep("_diff", colnames(row_data))) < 1) {
+    stop(paste0("'[contrast]_diff' columns are not present in '",
+                deparse(substitute(dep)),
+                "'.\nRun test_diff() to obtain the required columns."),
+         call. = FALSE)
+  }
+  if(!"significant" %in% colnames(row_data)) {
+    stop(paste0("'significant' column is not present in '",
+                deparse(substitute(dep)),
+                "'.\nRun add_rejections() to obtain the required column."),
+         call. = FALSE)
+  }
+  
+  # Filter for significant proteins only
+  filtered <- dep[row_data$significant, ]
+  
+  # Check for missing values
+  if(any(is.na(assay(filtered)))) {
+    stop("Cannot perform kmeans clustering with missing values")
+  }
+  
+  # Get centered intensity values ('centered')
+  if(type == "centered") {
+    rowData(filtered)$mean <- rowMeans(assay(filtered), na.rm = TRUE)
+    df <- assay(filtered) - rowData(filtered)$mean
+  }
+  # Get contrast fold changes ('contrast')
+  if(type == "contrast") {
+    df <- rowData(filtered) %>%
+      data.frame() %>%
+      column_to_rownames(var = "name") %>%
+      select(ends_with("_diff"))
+    colnames(df) <-
+      gsub("_diff", "", colnames(df)) %>%
+      gsub("_vs_", " vs ", .)
+  }
+  
+  # Facultative kmeans clustering
+  if(kmeans) {
+    set.seed(1)
+    df_kmeans <- kmeans(df, k)
+    if(type == "centered") {
+      # Order the k-means clusters according to the maximum fold change
+      # in all samples averaged over the proteins in the cluster
+      order <- data.frame(df) %>%
+        cbind(., cluster = df_kmeans$cluster) %>%
+        mutate(row = apply(.[, 1:(ncol(.) - 1)], 1, function(x) max(x))) %>%
+        group_by(cluster) %>%
+        summarize(index = sum(row)/n()) %>%
+        arrange(desc(index)) %>%
+        pull(cluster) %>%
+        match(seq(1:k), .)
+      df_kmeans$cluster <- order[df_kmeans$cluster]
+      matrix <- cbind(df, k = df_kmeans$cluster)
+    }
+    if(type == "contrast") {
+      # Order the k-means clusters according to their average fold change
+      order <- cbind(df, cluster = df_kmeans$cluster) %>%
+        gather(condition, diff, -cluster) %>%
+        group_by(cluster) %>%
+        summarize(row = mean(diff)) %>%
+        arrange(desc(row)) %>%
+        pull(cluster) %>%
+        match(seq(1:k), .)
+      df_kmeans$cluster <- order[df_kmeans$cluster]
+      matrix <- cbind(df, df_kmeans$cluster)
+    }
+  }
+  
+  return(matrix)
+}
+
+plot_heatmap_from_matrix <- function(matrix, col_limit = 6,
+                                     clustering_distance = c("euclidean", "maximum", "manhattan", "canberra",
+                                                             "binary", "minkowski", "pearson", "spearman", "kendall"),
+                                     row_font_size = 6, col_font_size = 10, ...){
+  
+  if(is.integer(col_limit)) col_limit <- as.numeric(col_limit)
+  if(is.integer(row_font_size)) row_font_size <- as.numeric(row_font_size)
+  if(is.integer(col_font_size)) col_font_size <- as.numeric(col_font_size)
+  
+  assertthat::assert_that(is.matrix(matrix),
+                          is.numeric(col_limit),
+                          length(col_limit) == 1,
+                          is.numeric(row_font_size),
+                          length(row_font_size) == 1,
+                          is.numeric(col_font_size),
+                          length(col_font_size) == 1)
+  
+  clustering_distance <- match.arg(clustering_distance)
+  
+  if("k" %in% colnames(matrix)) {
+    kmeans <- TRUE
+    col <- match("k", colnames(matrix))
+    df <- matrix[,-col]
+    df_kmeans <- matrix[,col]
+  } else {
+    kmean <- FALSE
+    df <- matrix
+  }
+  
+  if(ncol(df) == 1) {
+    col_clust = FALSE
+  } else {
+    col_clust = TRUE
+  }
+  if(nrow(df) == 1) {
+    row_clust = FALSE
+  } else {
+    row_clust = TRUE
+  }
+  
+  # Heatmap
+  ht1 = Heatmap(df,
+                col = circlize::colorRamp2(
+                  seq(-col_limit, col_limit, (col_limit/5)),
+                  rev(RColorBrewer::brewer.pal(11, "RdBu"))),
+                split = if(kmeans) {df_kmeans} else {NULL},
+                cluster_rows = col_clust,
+                cluster_columns = row_clust,
+                row_names_side = "left",
+                column_names_side = "top",
+                clustering_distance_rows = clustering_distance,
+                clustering_distance_columns = clustering_distance,
+                heatmap_legend_param = list(color_bar = "continuous",
+                                            legend_direction = "horizontal",
+                                            legend_width = unit(5, "cm"),
+                                            title_position = "lefttop"),
+                name = "log2",
+                row_names_gp = gpar(fontsize = row_font_size),
+                column_names_gp = gpar(fontsize = col_font_size),
+                ...)
+  # Plot
+  draw(ht1, heatmap_legend_side = "top")
+}
+```
+
+
+Read proteinGroups.csv that you got from Christos
+If at some point you decide you don't like a sample
+1) don't include it in the experiment design
+2) copy the proteingroups file and IN THE COPY:
+a) open it in notepad
+b) find "LFQ intensity" and replace/delete the "LFQ" 
+c) annotate in the script that you have done so
+
+I tried to do it a nice way by unselecting the column in the script, but for some insane reason it leads to a bug, which messes with matrix operations (needed for the heatmap and the correlation plot)
+```{r}
+data <- read.table("proteinGroups.txt", header = TRUE, sep = "\t", fill=TRUE) 
+data <- data[data$Reverse != "+" & data$Potential.contaminant != "+" 
+             &data$Only.identified.by.site !="+",]
+
+head(data) #Check what does "Protein.IDs" look like. Any suffixes (e.g. _SK1) need to be removed in next line  
+data$Protein.IDs <- gsub("_SK1", "", data$Protein.IDs)
+```
+
+O: there was a complicated bit of script that Wera wrote to add gene names. I rewrote it in three lines... 
+W: Load the data and change annotation so gene names are shown. This bit of code is here because Data from Christos does not have gene names in it, just fasta headers. So i cross refernce these to an excel file (all_east_ORFs.csv) with gene names
+
+```{r}
+allORFs<-read.delim("all_yeast_ORFs.csv", sep = ',') %>% 
+  select(Protein.IDs, Gene.names, Function)
+data <-  left_join(data, allORFs)
+```
+The previous step left some NAs, as allORFs contains only named genes. In this step, the NAs are replaced with systematic names
+
+```{r}
+#are there any duplicated genes?
+data$Gene.names %>% duplicated() %>% any()
+#how many?
+data %>% group_by(Gene.names) %>% summarize(frequency = n()) %>% 
+  arrange(desc(frequency)) %>% filter(frequency > 1)
+#make unique
+data_unique <- make_unique(data, "Gene.names", "Protein.IDs", delim = ";")
+data$name %>% duplicated() %>% any()
+data_unique$name<- make.names(data_unique$name, unique=TRUE)
+```
+
+Add experimental design (a file explaining which sample belongs to which condition)
+```{r}
+exp_design <- read.csv("ExpDesign.csv")
+exp_design$label<-as.character(exp_design$label)
+exp_design$condition<-as.character(exp_design$condition)
+exp_design$replicate<-as.numeric(exp_design$replicate)
+```
+
+Generate unique identifiers
+```{r}
+LFQ_columns <- grep("LFQ.", colnames(data_unique))
+data_se <- make_se(data_unique, LFQ_columns, exp_design) #this doesn't work--works if expdesign correct
+data_se_parsed <- make_se_parse(data_unique, LFQ_columns) #this works even when expdesign not correct
+```
+
+Data quality check--find how many proteins are detected and what is missing
+```{r}
+#Plotting various stuff. If there is an error with any of the plotting functions execute
+while (!is.null(dev.list()))  dev.off()
+
+#How the proteins are distributed among samples (how many proteins appears only in one sample, how many only in two, etc.)
+plot_frequency(data_se_parsed)
+
+#these 3 lines of code save a pdf file with the plot.
+pdf("plot_frequency_data_se_parsed.pdf", width=8, height=5, pointsize=1)
+plot_frequency(data_se_parsed)
+dev.off()
+
+pdf("plot_frequency_data_se.pdf", width=8, height=5, pointsize=1)
+plot_frequency(data_se)
+dev.off()
+
+#Filter proteins that are missing in some of the replicates. The number means in how many replicates within a condition the protein may be missing. It is enough that it is included in one condition to pass. 
+data_filt <- filter_missval(data_se, thr = 0)
+
+#How many proteins are detected in your samples 
+plot_numbers(data_filt)
+
+pdf("plot_numbers_data_filt.pdf", width=8, height=5, pointsize=1)
+plot_numbers(data_filt)
+dev.off()
+
+#How many proteins overlap in different samples 
+plot_coverage(data_filt)
+
+pdf("plot_coverage_data_filt.pdf", width=8, height=5, pointsize=1)
+plot_coverage(data_filt)
+dev.off()
+
+#Normalise the data. This is to be able to compare less and more busy samples.
+data_norm <- normalize_vsn(data_filt)
+plot_normalization(data_filt, data_norm)
+#Please use 'meanSdPlot' to verify the fit
+
+pdf("plot_normalization.pdf", width=8, height=5, pointsize=1)
+plot_normalization(data_filt, data_norm)
+dev.off()
+
+#Pattern of missing values. White is missing, black is valid.
+plot_missval(data_filt)
+
+pdf("plot_missval_data_filt.pdf", width=8, height=5, pointsize=1)
+plot_missval(data_filt)
+dev.off()
+
+#What is the intensity of missing values. 
+plot_detect(data_filt)
+
+pdf("detect_data_filt.pdf", width=8, height=5, pointsize=1)
+plot_detect(data_filt)
+dev.off()
+
+#Missing values need to be imputed. If the intensities are low for the missing values, you have predominantly MNAR and you can use minprob function 
+data_imp <- impute(data_norm, fun = "MinProb")
+
+plot_imputation(data_norm, data_imp)
+
+pdf("plot_imputation.pdf", width=8, height=5, pointsize=1)
+plot_imputation(data_norm, data_imp)
+dev.off()
+```
+
+Set threshold for what's significant
+```{r}
+#compares everything with everything--false positives are more probable
+data_diff <- test_diff(data_imp, type = "all")
+#compares only control/wt to other conditions
+data_diff_control <- test_diff(data_imp, type = "control", control = "b_mad2")
+#significant if pvalue < 0.05 and fold change > 1.5
+dep <- add_rejections(data_diff, alpha = 0.05, lfc = log2(1.5))
+dep_control<-add_rejections(data_diff_control, alpha = 0.05, lfc = log2(1.5))
+dep_relaxed <- add_rejections(data_diff, alpha = 0.15, lfc = log2(1.5))
+```
+
+Compare how similar are the samples
+```{r}
+#Takes 50 most abundant proteins and drops dimensions 
+plot_pca(dep, x = 1, y = 2, n = 50, point_size = 2)
+
+pdf("plot_pca_50.pdf", width=8, height=5, pointsize=1)
+plot_pca(dep, x = 1, y = 2, n = 50, point_size = 2)
+dev.off()
+
+#Pearson correlation matrix
+plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+
+pdf("plot_cor.pdf", width=8, height=5, pointsize=1)
+plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+dev.off()
+
+#Heatmap. K=how many clusters are permitted
+plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = FALSE)
+
+pdf("plot_heatmap.pdf", width=8, height=5, pointsize=1)
+plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = FALSE)
+dev.off()
+
+#See if there are any interesting clusters (might be hard to read)
+plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = TRUE)
+
+pdf("plot_heatmap_names.pdf", width=8, height=5, pointsize=1)
+plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = TRUE)
+dev.off()
+```
+
+O: These are plots based on the function at the top of the script. I hardly ever use them
+Update: This doesn't work anymore, I don't care about debugging it
+```{r}
+#matrix <- get_kmeans_matrix(dep, type = "centered", kmeans = TRUE, k=6)
+#write.csv(matrix, file="matrix k6.csv")
+
+
+#plot_heatmap_from_matrix(matrix, show_row_names = F)
+
+#pdf("plot_heatmap_from_matrix.pdf", width=8, height=5, pointsize=1)
+#plot_heatmap_from_matrix(matrix, show_row_names = F)
+#dev.off()
+
+```
+
+You can do the same analysis for less stringent cutoffs
+```{r}
+plot_pca(dep_relaxed, x = 1, y = 2, n = 50, point_size = 2)
+
+pdf("plot_pca_50 dep_relaxed.pdf", width=8, height=5, pointsize=1)
+plot_pca(dep_relaxed, x = 1, y = 2, n = 50, point_size = 2)
+dev.off()
+
+plot_cor(dep_relaxed, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+
+pdf("plot_cor dep_relaxed.pdf", width=8, height=5, pointsize=1)
+plot_cor(dep_relaxed, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+dev.off()
+
+plot_heatmap(dep_relaxed, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = TRUE)
+
+pdf("plot_heatmap dep_relaxed.pdf", width=8, height=5, pointsize=1)
+plot_heatmap(dep_relaxed, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = FALSE)
+dev.off()
+
+#below is from the function. DOesn't work anymore
+#matrix <- get_kmeans_matrix(dep_relaxed, type = "centered", kmeans = TRUE, k=6)
+#write.csv(matrix, file="matrix k6 dep_relaxed.csv")
+
+#plot_heatmap_from_matrix(matrix, show_row_names = F)
+
+#pdf("plot_heatmap_from_matrix dep_relaxed.pdf", width=8, height=5, pointsize=1)
+#plot_heatmap_from_matrix(matrix, show_row_names = F)
+#dev.off()
+```
+
+#Groups of proteins
+This list is incomplete, you need to define groups that you want to use depending on your data
+```{r}
+PP2A <- c("RTS1", "PPH21","PPH22", "CDC55", "TPD3")
+recomb<- c("SPO11","RED1","HOP1","DMC1","FOB1","HFM1","MSH2","MSH3","MSH4","MSH5","MLH1",  "MLH3","NDJ1","PCH2","SPO16","ZIP2","ZIP4","RAD51", "ZIP1")
+CPC <- c("IPL1","SLI15","BIR1", "NBL1")
+SGO1 <- "SGO1"
+coh_loader<-c("SCC2","SCC4")
+condensin <- c("SMC2","SMC4","YCS4", "BRN1","YCG1","YLR086W")
+cohesin <- c("SMC1","SMC3","REC8","PDS5","IRR1","RAD61")
+monopolin <- c("CSM1","LRS4","HRR25", "MAM1","YPL204W")
+KT<-c("NDC80","NNF1", "MCM22", "ASK1", "MIF2", "SPC34", "DAD2", "NKP2", "CFT3", "SPC24", "CEP3", "NUF2", "SLK19", "CTF19", "NSL1", "MCM16", "DUO1", "SPC105", "NKP1", "MTW1", "IML3", "AME1", "SPC19", "CHL4", "MCM21", "SKP1", "KRE28", "SPC25", "CNN1", "DAM1","CBF2","OKP1","DSN1")
+histones<-c("HTA1", "HTA2", "HTB1", "HTB2", "HHT1", "HHT2", "HHF1", "HHF2", "HHO1", "CSE4","YBR010W", "YDR225W","YDR224C", "YNL030W")
+meiosis <- c("SPO13", "SPO11", "ZIP1","RED1","HOP1","DMC1","FOB1","HFM1","MSH2","MSH3","MSH4","MSH5","MLH1",
+ "MLH3","NDJ1","PCH2","SPO16","ZIP2","ZIP4","RAD51", "PFS1")
+inKT <- c("CBF2","CNN1", "WIP1", "MIF2", "MCM16", "CTF3", "MCM22", "IML3", "CHL4", "MHF1", "MHF2", "MCM21", "AME1", "CTF19", "OKP1", "CEP3", "NKP1", "CTF13", "NKP2" )
+outKT <- c("SPC105", "YDR532", "DSN1", "MTW1", "NSL1", "PNF1", "NDC80", "NUF2", "SPC24", "SPC25", "KRE28", "NNF1", "SPC34", "DUO1", "DAM1")
+error <- c("IPL1", "BIR1", "MPS1", "BUB3", "BUB1", "SLI15","NBL1")
+
+```
+
+now, let's plot the interesting ones (reusing old sets so there may be irrelevant ones but whatever so far)
+```{r}
+#this are colors I once used, this is probably not relevant
+#plot_style <- scale_fill_manual(values=c("#b2b2b2")) + scale_color_manual(values=c("#7570B3", "#E6AB02", "#E7298A"))
+# ("#b2b2b2", "#7570B3","#E6AB02", "#D95F02", "#E7298A", "#66A61E"))
+
+#these are the possibilities. Pick the proteins you like
+#group that was defined in the previous chunk
+plot_single(dep, proteins = error, type = "centered")
+plot_single(dep, proteins=c("SPC105", "BUB1", "MPS1", "IPL1"), type="centered")
+plot_single(dep, proteins=c("SPC105", "BUB1", "MPS1", "IPL1"))
+
+#example how to save the plot
+pdf("Ipl1_Msp1_abundance.pdf")
+plot_single(dep, proteins=c( "BUB1", "IPL1"), type="centered")
+dev.off()
+
+```
+
+Define groups for the volcano plots
+```{r}
+df_wide <- get_df_wide(data_diff)
+write.csv(df_wide, file="df_wide.csv")
+DETdata<- df_wide
+#generate a column that will say if a protein belongs to any of the categories
+DETdata <- DETdata %>% 
+  mutate(Function= 
+                  ifelse(name %in%  KT, "kinetochore",
+                  ifelse(name %in%  error, "CPC or SAC",
+                            ifelse (1,"a"))))
+
+#make this new column as factor, because it will be easier to add aesthetics
+DETdata$Function <- as.factor (DETdata$Function)
+```
+
+Defines how to plot the volcano. Don't change anything with the exception of colours
+```{r}
+get_plotly_volcano <- function(DETdata,contrast,filename.pdf,filename.html) {
+  #find relevant columns
+  contrast_cols<-grep(contrast,names(DETdata),value=T)
+  #subset the dataset to have the contrast cols, Function, and name
+  contrast_cols<-grep(contrast,names(DETdata),value=T)
+name_cols<-c("Function","name","Protein.IDs")
+to_plot_cols<-c(name_cols,contrast_cols)
+#this object has just the necessary columns
+to_plot<-DETdata[,to_plot_cols]
+#this will be x and y of the plot
+x<-to_plot[,grep("diff",names(to_plot),value=T)]
+y<-to_plot[,grep("p.val",names(to_plot),value=T)]
+
+to_plot<-cbind(to_plot,x,y)
+
+contrast_volcano<-ggplot(DETdata, aes(x = x, y = -log10(y))) + 
+  geom_point(aes(colour=Function, text=name, text2=Protein.IDs),alpha=0.9) +
+  geom_hline(yintercept = -log10(0.05), alpha = 0.2, linetype="dashed") + 
+  geom_vline(xintercept = -2, alpha = 0.2, linetype="dotted") + 
+  geom_vline(xintercept = 2, alpha = 0.2, linetype="dotted") +
+#define colours here. Goes alphabetically
+  scale_colour_manual(name="Protein",values=c("#b2b2b2", "#7570B3","#E6AB02", "#D95F02", "#E7298A", "#66A61E", "#1b1f1c", "#a34ad4")) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  theme_classic() +
+  labs(title = contrast) +
+  xlab("log2(fold change)") +
+  ylab("-log10(p value)")
+
+#print this file to the console and save as pdf
+print(contrast_volcano)
+
+pdf(filename.pdf, width=8, height=5, pointsize=1) 
+print(contrast_volcano)
+dev.off()
+
+#now make it an interactive html file. Plotly package makes interactive plots. htmlwidgets allow you to save your plot as html, so it can be opened and interacted with in a browser
+
+contrast_volcano_plotly<-ggplotly(contrast_volcano)
+contrast_volcano_plotly
+htmlwidgets::saveWidget(contrast_volcano_plotly, filename.html)
+}
+```
+
+Generate all possible contrasts. You can have a lot or just a few, depending what you set with the thresholds. contrast etc. = condition1_vs_condition2, for example
+```{r}
+get_plotly_volcano(DETdata = DETdata,contrast = "b_mad2_vs_c_mad3", filename.pdf = "b_mad2_vs_c_mad3.pdf",filename.html = "b_mad2_vs_c_mad3.html")
+```
+
+W: I also want to plot lfq intensity vs fold change - just wt vs !wt. plots like in Xun Bao paper from Sawin lab. I will use the data from above - average signal as well as fold change is there. 
+O: The paper is [Bao et al. 2018](https://elifesciences.org/articles/33465). It does have the different volcano plots but it doesn't have the bar/scatter plot. And it is for SILAC data... There is one major difference in comparison to Wera's previous script: now it calculates geometric, not arithmetic mean,which is supposed to handle 
+
+Well, actually Wera's script got 90% rewritten as it wasn't automated and required counting the columns...
+
+First I need to take intensity values and "unlog" them (i.e. take 2 and raise it to the power of values in the column)
+```{r}
+#this depends on the data, there is no pattern that I can regex
+names(df_wide)
+complex.int <- df_wide[,1:8] # number == 1:samples+1
+
+#the data I already have here is in log form, so I have to unlog it, and then sum it up, as i have not found a way to perform this operation already on logarithms
+
+unlogged<-2^complex.int[,-1] %>% 
+  rename_with(function(x){paste0(x,".unlogged")})
+
+complex.stat <- df_wide %>% select(ends_with(c("_diff", "_p.val")))
+complex.data <-cbind(complex.int, unlogged, complex.stat)
+```
+
+
+```{r}
+#exp(mean(log(x))) to calculate geometric mean
+complex.geomeans <- function (data=complex.data) {
+  complex.sub <- 
+  grep("^[a-z]?_.*[[:digit:]]$", names(data), value = T)
+  con.names <- unique(gsub("_[[:digit:]]", "", complex.sub))
+  loop.data <- complex.data
+  for (i in 1:length(con.names)) {
+    select.data <- data %>% 
+      select(starts_with(con.names[i]) & ends_with("unlogged"))
+    add <- apply(select.data, 1, function(x) exp(mean(log(x))))
+    loop.data <- cbind(loop.data, add)
+  }
+  
+  new.names <- c(names(data), paste0(con.names,"_geomean"))
+  names(loop.data) <- new.names
+  print(loop.data)
+}
+
+for.lfq.plot<- complex.geomeans()
+head(for.lfq.plot)
+
+#if for some reason the function fails, use instead
+#use a_con1_geomean, b_con2_geomean etc. as a column name (a_con1 etc. should be the same as in your experiment design
+  #for.lfq.plot <-cbind(complex.int, unlogged, complex.stat)
+  #for.lfq.plot$a_con1_geomean <- for.lfq.plot %>% select(starts_with("a_") & ends_with("unlogged")) %>% apply(.,  1, function(x) exp(mean(log(x))))
+
+
+lfq.sums <- function(data=for.lfq.plot, contrast) {
+  con <- data %>% select(starts_with(contrast) & ends_with("geomean"))
+  names(con) <- "cond"  
+  for.lfq.plot2 <- cbind(for.lfq.plot , con)
+  add <- for.lfq.plot2 %>% 
+    select(ends_with("geomean"), cond) %>%  
+    mutate(across(!cond, ~.x + cond))
+  new.names <- c(paste0(contrast, "_vs_", sub("_geomean","", names(add)), "_plus"))
+  names(add) <- new.names
+  avoid <- paste0(contrast,"_vs_",contrast)
+  avoid2 <- paste0(contrast,"_vs_cond")
+  add <- add %>% select(-starts_with( c(avoid, avoid2)))
+  fin.data <- cbind(data, add)
+  print(fin.data)
+}
+
+for.lfq.plot2 <- lfq.sums(data=for.lfq.plot, contrast="b_mad2")
+names(for.lfq.plot2)
+```
+
+Full.contrast is a_con1_vs_b_cond2 etc., you need to change it
+The plot will look a bit empty. To make it look better, add manual cutoffs (see note in script below)
+You can also change the colors but otherwise run as it is
+```{r}
+get_plotly_volcano_int <- function(data=for.lfq.plot2, full.contrast, filename.pdf, filename.html) {
+  #find relevant columns
+  contrast_cols<-grep(full.contrast, names(data),value=T)
+  #subset the dataset to have the contrast cols, Function, and name
+  name_cols<-c("name")
+to_plot_cols<-c(name_cols,contrast_cols)
+#this object has just the necessary columns
+to_plot<-data[,to_plot_cols]
+#this will be x and y of the plot
+x<-to_plot[,grep("diff",names(to_plot),value=T)]
+y<-to_plot[,grep("plus",names(to_plot),value=T)]
+pvalue<-to_plot[,grep("val",names(to_plot),value=T)]
+to_plot<-cbind(to_plot,x,y,pvalue)
+
+to.plot <- to_plot %>% 
+  mutate(signif = ifelse(pvalue < 0.0001, "<0.0001",
+                ifelse(pvalue < 0.001, "<0.001",
+                ifelse(pvalue < 0.01, "<0.01",  
+                ifelse(pvalue < 0.05, "<0.05",
+                      ifelse (1,"not significant"))))))
+
+
+contrast_volcano<-ggplot(to.plot, aes(x = x, y = log10(y))) + 
+  geom_point(aes(colour = signif, text = name),alpha=0.9) +
+  geom_hline(yintercept = -log10(0.05), alpha = 0.2, linetype="dashed") + 
+  geom_vline(xintercept = -2, alpha = 0.2, linetype="dotted") + 
+  geom_vline(xintercept = 2, alpha = 0.2, linetype="dotted") +
+#define colours here. P values go first from the lowest, ns is last
+  scale_colour_manual(name="Significance",values=c("#7570B3","#E6AB02", "#D95F02", "#E7298A", "#b2b2b2")) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  theme_classic() +
+  labs(title = full.contrast) +
+  xlab("log2 fold change LFQ intensity") +
+  ylab("log10 sum of LFQ intensity")   
+#the cutoffs are defined here. Change the numbers to use in your experiment: put a + at the end of line above and delete the # in line below
+# coord_cartesian(ylim=c(5,11))
+
+#print this file to the console and save as pdf
+print(contrast_volcano)
+
+pdf(filename.pdf, width=8, height=5, pointsize=1) 
+print(contrast_volcano)
+dev.off()
+
+#now make it an interactive html file. Plotly package makes interactive plots. htmlwidgets allow you to save your plot as html, so it can be opened and interacted with in a browser
+
+contrast_volcano_plotly<-ggplotly(contrast_volcano)
+contrast_volcano_plotly
+htmlwidgets::saveWidget(contrast_volcano_plotly, filename.html)
+}
+
+
+```
+
+Now plot your volcanoes
+```{r}
+get_plotly_volcano_int(for.lfq.plot2, "b_mad2_vs_c_mad3", "test.pdf", "test.html")
+```
+
+
+This creates a scatterplot to check what intensity is your favourite protein.
+```{r}
+for.lfq.scatter <- for.lfq.plot2 %>% 
+  select(name, contains("geomean")) %>% 
+  pivot_longer(cols = contains("geomean"), names_to = "condition", values_to = "int.sum") %>% 
+  mutate(role = ifelse(name %in%  error, "CPC or SAC",
+                    ifelse (1,"a")))
+
+lfq_scatterplot <- ggplot(for.lfq.scatter, aes(colour=role, x = condition, y =log10(int.sum))) + 
+  geom_point(aes(text=name),alpha=1,position=position_jitter(w=0.4)) +
+  theme_classic() +
+  scale_colour_manual(name="Protein",values=c("#b2b2b2", '#f781bf','#377eb8','#4daf4a','#984ea3','#ff7f00','#ffff33','#e41a1c','#a65628')) +
+  labs(title = "Signal intensity in different conditions") +
+  xlab("conditions") +
+  ylab("log10(signal intensity)")
+
+lfq_scatterplot
+
+pdf("lfq_scatterplot.pdf")
+lfq_scatterplot
+dev.off()
+
+lfq_scatterplot_plotly<-ggplotly(lfq_scatterplot)
+lfq_scatterplot_plotly
+htmlwidgets::saveWidget(lfq_scatterplot_plotly, "lfq_scatterplot.html")
+```
+
+Save the workspace
+```{r}
+#change names, I am missing some stuff
+save(allORFs, data, data_diff, data_diff_control, data_filt, data_imp,data_norm, data_se, data_se_parsed, data_unique, dep, dep_control,  dep_relaxed, DETdata, df_wide, exp_design, for.lfq.plot2,
+     file = "data_LFQ.RData")
+#load("data_LFQ.RData")
+```

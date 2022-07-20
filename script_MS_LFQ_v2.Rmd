@@ -533,7 +533,7 @@ complex.data <-cbind(complex.int, unlogged, complex.stat)
 complex.geomeans <- function (data=complex.data) {
   complex.sub <- 
   grep("^[a-z]?_.*[[:digit:]]$", names(data), value = T)
-  con.names <- unique(gsub("_[[:digit:]]", "", complex.sub))
+  con.names <- unique(gsub("_[[:digit:]]$", "", complex.sub))
   loop.data <- complex.data
   for (i in 1:length(con.names)) {
     select.data <- data %>% 
@@ -572,6 +572,7 @@ lfq.sums <- function(data=for.lfq.plot, contrast) {
   print(fin.data)
 }
 
+#the name needs to be a full name of the condition
 for.lfq.plot2 <- lfq.sums(data=for.lfq.plot, contrast="b_mad2")
 names(for.lfq.plot2)
 ```
